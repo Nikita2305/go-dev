@@ -324,19 +324,19 @@ sync.WaitGroup: Add / Wait
 
 Имплементацию я предлагаю в `reusable_barrier`
 
-#### Практика 3
+#### Практика 3 - TODO
 
-Реализуем семафор через канал - TODO
+Реализуем семафор через канал
 
-#### Практика 4
+#### Практика 4 - TODO
 
-Реализуем thread safe очередь - TODO
+Реализуем thread safe очередь
 
-#### Практика 5
+#### Практика 5 - TODO
 
-Реализуем cache with ttl and lazy initialization - TODO
+Реализуем cache with ttl and lazy initialization
 
-#### Пракика 6
+#### Пракика 6 - TODO
 
 Merge N каналов (fan-in)
 
@@ -346,3 +346,15 @@ func Merge[T any](chans ...<-chan T) <-chan T
 Завершается, когда все входные каналы закрылись
 
 Что проверяют: select, WaitGroup, модель завершения, закрытие канала
+
+#### Практика 7 - TODO
+
+worker pool с graceful shutdown и контекстами
+
+#### Практика 8 - TODO
+
+конкурентный ретрай с idempotent-логикой
+
+#### Практика 9 - TODO
+
+кэш с RWMutex и atomic.Value
