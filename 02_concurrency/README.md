@@ -292,7 +292,7 @@ sync.RWMutex: Lock/Unlock/RLock/RUnlock - полезно в кэше с высо
 sync.Once: Do - полезно для ленивой инициализации
 sync.WaitGroup: Add / Wait
 
-О плюсах RWMutex над Mutex, можно не говорить. Но, как говорится, минусы будут? Согласно статье https://dev.to/leapcell/go-lock-performance-rwmutex-vs-mutex-in-various-scenarios-57p7 RWMutex действительно стоит использовать, когда операций на чтение значительно больше чем операций на запись. Дополнительно стоит понимать что структура RWMutex сложнее чем просто Mutex. Исходя из этого, если у нас простые критические секции (не IO, например) при частых чтениях, то возможно RWMutex всё равно проиграет Mutex по перфомансу.
+О плюсах RWMutex над Mutex, можно не говорить. Но, как говорится, минусы будут? Согласно статье https://dev.to/leapcell/go-lock-performance-rwmutex-vs-mutex-in-various-scenarios-57p7 RWMutex действительно стоит использовать, когда операций на чтение значительно больше чем операций на запись. Дополнительно стоит понимать что структура RWMutex сложнее чем просто Mutex. Исходя из этого, если у нас простые критические секции (не IO, например) при частых чтениях, то возможно RWMutex всё равно проиграет Mutex по перфомансу. Другая проблема RWMutex - starvation Lock на запись, ведь этот тип мьютекса отдаёт приоритет блокировкам на чтение, и это может быть критично, если запись важна быстрая.
 
 #### Практика 1
 
@@ -324,13 +324,21 @@ sync.WaitGroup: Add / Wait
 
 Имплементацию я предлагаю в `reusable_barrier`
 
-#### Практика 3 - TODO
+#### Практика 3
 
-Реализуем семафор через канал
+Реализуем семафор через канал. Имплементация находится в "semaphore_simple". Де факто буферизованный канал и есть семафор.
 
 #### Практика 4 - TODO
 
 Реализуем thread safe очередь
+
+Мы можем хотеть Unbounded Blocking Queue, можем хотеть Bounded Blocking Queue.
+
+В первом случае мы отдельно реализуем Queue, а затем через sync.Cond + Mutex будем оповещать ждущих консьюмеров.
+
+Во втором случае мы можем просто использовать канал! Однако можно использовать подход аналогичный тому, что выше. Из плюсов - возможность реализации soft backpressure: когда мы используем метод TryEnqueue в продьюсерах и с экспоненциальной задержкой ретраим попытки вставить. С каналом такой логики добиться было бы невозможно.
+
+В качестве тренировки давайте выберем самый сложный вариант и реализуем Bounded Blocking Queue на sync.Mutex + sync.Cond
 
 #### Практика 5 - TODO
 
@@ -347,14 +355,182 @@ func Merge[T any](chans ...<-chan T) <-chan T
 
 Что проверяют: select, WaitGroup, модель завершения, закрытие канала
 
+### Ловим гонки
+
+Что если мы написали программу с использованием многозадачости, однако она работает некорректно?
+
+`go run -race` / `go test -race`
+
+Рассмотрим `go run -race main_10.go`
+
+Получим
+
+```
+WARNING: DATA RACE
+Write at 0x00c00000e0df by goroutine 6:
+  main.main.func1()
+      /Users/nikitanikitin/Activities/go-dev/02_concurrency/main_10.go:12 +0x2c
+
+Previous read at 0x00c00000e0df by main goroutine:
+  main.main()
+      /Users/nikitanikitin/Activities/go-dev/02_concurrency/main_10.go:15 +0xa4
+
+Goroutine 6 (running) created at:
+  main.main()
+      /Users/nikitanikitin/Activities/go-dev/02_concurrency/main_10.go:11 +0x9c
+```
+
+Что мы получили?
+
+Def. data race - ситуация при которой две горутины
+- одновременно обращаются к одной памяти
+- хотя бы одна из них пишет
+- это не примитив синхронизации
+
+Def. race condition - ситуация при котором результат выполнения программы зависит от неконтролируемого порядка выполнения операций
+
+В большинстве случаев data race приводит к race condition. Но, конечно, можно построить программу, в которой data race не приводит к race condition: https://blog.regehr.org/archives/490
+
+```
+x := 0
+go func() { x = 1 }()
+go func() { x = 2 }()
+... // Then never use 'x'
+```
+
+Результат исполнения не зависит от x, поэтому не race condition, однако data race, и `-race` такое поймает.
+
+Из забавного - как легко можно избавиться от data race, но не race condition: навесить мьютекс на код выше. После исполнения не понятно какое значение будет у x, однако конкурентного доступа на запись уже не будет. 
+
+### На уровень ниже
+
+Поскольку мы уже почти можно сказать уверенные пользователи Mutex, RWMutex и Cond - можно задуматься над их реализацией. Что было раньше курица (atomic) или яйцо (mutex). Ладно, конечно курица.
+
+Базовые обучательные мьютексы: spinlock и ticketlock.
+
+```
+type SpinLock struct {
+    locked atomic.Int64
+}
+
+func (m *SpinLock) Lock() {
+    for !m.locked.CompareAndSwap(0, 1) {
+        runtime.Gosched() // Park
+    }
+}
+
+func (m *SpinLock) Unlock() {
+    m.locked.Store(0)
+}
+```
+
+Немного улучшенная версия чтобы избежать ненужного starvation (одна из горутин может попасть в live lock): Ticketlock
+
+```
+type TicketLock struct {
+    currentTicket atomic.Uint64
+    newTicket atomic.Uint64
+}
+
+func NewTicketLock() (*TicketLock) {
+    return &TicketLock{
+        currentTicket: atomic.Uint64{1},
+        newTicket: atomic.Uint64{0}
+    }
+}
+
+func (t *TicketLock) Lock() {
+    myTicket = newTicket.Add(1)
+    for myTicket != currentTicket.Load() {
+        runtime.Gosched()
+    }
+}
+
+func (t *TicketLock) Unlock() {
+    currentTicket.Add(1)
+}
+```
+
+Таким образом критические секции будут исполняться в порядке блокировки. Однако в целом подход с крутящейся блокировкой - не очень. Можно использовать буферизованный канал размером 1. Первый, кто заблокируется - запишет туда. Если захотим разблокировать - считаем оттуда. Главное поставить селект на разблокировке чтобы никогда на ней не блокироваться.
+
+#### Практика - реализовать RWLock
+
+### Продвинутый уровень
+
+context.Context
+
+```
+import "context"
+```
+
+```
+ctx := context.Background() - создать базовый
+ctx = context.WithValue(ctx, key, value) - добавить ключ
+ctx, cancel := context.WithTimeout(ctx, time.Second * 2)
+ctx, cancel := context.WithCancel(ctx)
+```
+
+юзкейсы:
+
+```
+// works = array
+for _, work := range works {
+    select {
+        case <-ctx.Done():
+            return
+        default:
+            doWork(ctx, work)
+    }
+}
+```
+
+Или
+
+```
+// works = channel
+for {
+    select {
+        case <-ctx.Done():
+            return
+        case work, ok := <- works:
+            if !ok {
+                return
+            }
+            doWork(ctx, work)
+    }
+}
+```
+
+Из важного - если создали cancel - придётся использовать cancel (иначе утечка ресурсов)
+
+В широком смысле это способ родительской горутины сказать всем порождённым остановиться. В каком случае стоит остановиться?
+
+Например нам пришёл сигнал:
+
+```
+ctx, cancel := context.WithCancel(context.Background())
+signals := make(chan os.Signal, 1) 
+signal.Notify(signals, syscall.SIGTERM)
+
+go func(ctx *context.Context) {
+    <- signals
+    cancel()
+}(ctx)
+```
+
+Стоит не забывать про signal.Stop для остановки прослушки.
+
 #### Практика 7 - TODO
 
 worker pool с graceful shutdown и контекстами
 
+В папочке `worker_pool`
+
+Тут наверное из возможных улучшений - нужно наладить работу с lifecycle:
+
+Start(ctx) -> создание внутреннего контекста с отменой
+Shutdown(ctx) -> отмена внутреннего контекста и ожидание завершения wg вместе с ctx.Done
+
 #### Практика 8 - TODO
 
 конкурентный ретрай с idempotent-логикой
-
-#### Практика 9 - TODO
-
-кэш с RWMutex и atomic.Value
